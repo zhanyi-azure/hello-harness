@@ -7,15 +7,27 @@
 # stdio 传输的含义：stdio_client 会把 mcp_demo.py 作为子进程启动，
 # 通过它的标准输入/输出收发 MCP 协议消息——宿主和服务器就这样隔空对话。
 import asyncio
-import sys
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
 
 async def main():
-    # 服务器启动参数：用【当前这颗 .venv 的 python】启动 mcp_demo.py
-    # （sys.executable = 正在运行本脚本的 python，保证两边用的是同一个 mcp 库）
-    params = StdioServerParameters(command=sys.executable, args=["mcp_demo.py"])
+    # 服务器启动参数（v2 修复）：解释器和脚本全部写【绝对路径】，不赌 PATH、不赌 cwd。
+    #
+    # 病根回顾——stdio 模式下，宿主用 command 指定的解释器去【启动一个子进程】，
+    # 这个子进程的环境完全是隐式的，两处最容易翻车：
+    # ① 裸 "python" 在 Windows 上按 PATH 找到的多半是全局 Python——
+    #    它没装 mcp 包，server 一启动就 ModuleNotFoundError 秒退；
+    #    宿主还傻等 initialize 握手 → 对端进程已关闭 → McpError: Connection closed。
+    # ② args 用相对路径 "mcp_demo.py" 时，子进程按【继承的工作目录】找脚本，
+    #    换个目录启动客户端，server 同样秒退，症状一模一样。
+    #
+    # 所以 harness 工程的铁律：凡是"拉起另一个进程"，解释器、脚本、工作目录
+    # 全部显式指定——确定性优先，"在我电脑上能跑"不算数。
+    params = StdioServerParameters(
+        command=r"D:\likeme\hello-harness\.venv\Scripts\python.exe",
+        args=[r"D:\likeme\hello-harness\mcp_demo.py"],
+    )
 
     async with stdio_client(params) as (read, write):
         # ClientSession 负责协议的握手与消息收发
