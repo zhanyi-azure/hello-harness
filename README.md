@@ -48,6 +48,9 @@ python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
 copy .env.example .env    # 然后填入你的 DeepSeek API key
+
+# 可选：设置 agent 的工作区根——所有相对路径都锚定到这里（不设则默认为启动目录）
+$env:MINI_HARNESS_ROOT = "D:\likeme"
 ```
 
 ## 使用
