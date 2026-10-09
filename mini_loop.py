@@ -4,6 +4,7 @@
 # v2 的核心原则：【错误是数据，不是终点】——
 #   把错误当成回执喂回给模型，它下一轮就能自我纠正；
 #   而异常一旦炸穿循环，整个对话死亡，模型"失忆"，谁也救不了。
+import argparse   # v2.1 新增：解析命令行参数（修复"参数未生效"）
 import json
 import os
 from dotenv import load_dotenv
@@ -34,6 +35,14 @@ def list_dir(path="."):
     except FileNotFoundError:
         return f"错误：目录 {path} 不存在"
 
+def write_file(path, content):
+    """v2.2 新增：第一个【有副作用】的工具——它不读取世界，它改动世界。
+    读类工具（read_file/list_dir）搞砸了最多是"没看到"；
+    写类工具搞砸了是覆盖别人的文件——所以它必须额外过权限闸门。"""
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(content)
+    return f"已写入 {path}({len(content)} 字符)"
+
 # ---------- ② 工具说明书 ----------
 TOOLS_SCHEMA = [
     {
@@ -63,11 +72,30 @@ TOOLS_SCHEMA = [
                 "required": ["path"],
             },
         },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "write_file",
+            "description": "写入/覆盖文本文件，有副作用（会创建或覆盖目标文件，被覆盖的内容无法恢复）",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "目标文件路径"},
+                    "content": {"type": "string", "description": "要写入的完整文本内容"}
+                },
+                "required": ["path", "content"],
+            },
+        },
     }
 ]
 
 # ---------- ③ 注册表：名字 → 函数 ----------
-TOOL_FUNCS = {"read_file": read_file, "list_dir": list_dir}
+TOOL_FUNCS = {"read_file": read_file, "list_dir": list_dir, "write_file": write_file}
+
+# 危险名单：出现在这里的工具会改动真实世界（磁盘），
+# 每次执行前必须获得人工放行（y）。读类工具不需要——看一眼世界是安全的。
+RISK_TOOLS = {"write_file"}
 
 
 # ---------- ③.5 安全执行器（v2 新增） ----------
@@ -97,6 +125,30 @@ def execute_tool(call):
         # 下一轮就知道该怎么改
         return f"错误：参数不是合法 JSON：{call.function.arguments}"
 
+    # 第 2.5 步：权限闸门（v2.2 新增）。危险工具在执行前先过人这一关。
+    # 为什么用 input() 问人而不是直接放行？因为模型是概率系统，
+    # 它"想写"不等于"该写"——涉及改动真实世界的决定，最终拍板的必须是人。
+    if name in RISK_TOOLS:
+        # 把参数摘要打出来给人看（内容太长就截断），人要知道自己到底在放行什么
+        args_view = ", ".join(f"{k}={str(v)[:60]!r}" for k, v in args.items())
+        print(f"⚠ 即将执行 {name}({args_view})，允许吗？(y/n)")
+        try:
+            answer = input("> ").strip().lower()
+            # Windows 坑：PowerShell 5.1 管道喂入的文本自带 UTF-8 BOM 前缀
+            # （U+FEFF），它不是空白字符，上面的 strip() 去不掉——
+            # 不剥掉它，'U+FEFFy' 永远不等于 'y'，放行永远会被误判成拒绝。
+            answer = answer.replace(chr(65279), "")   # chr(65279) = U+FEFF（BOM）
+        except EOFError:
+            # 输入流已关闭（没人可问）时视为拒绝：宁可错杀不可放行（fail-closed）
+            answer = ""
+        if answer != "y":
+            # 【拒绝也是数据】拒绝不抛异常、不退出程序，而是返回一句说明文字：
+            # 1) 这句话会作为正常回执进入对话，模型读到"被拒绝+为什么"，
+            #    下一轮就能自己调整方案（换路径/改问用户），对话继续活着；
+            # 2) 若这里抛异常，会炸穿 while 循环——对话死亡，且模型永远
+            #    不知道"为什么被拒"，连补救的机会都没有。
+            return "用户拒绝了本次 write_file 操作，请改用其他方案或询问用户"
+
     # 第 3 步：执行。前面两步都过了，执行仍可能翻车
     # （如 read_file 收到目录、参数名对不上等），用兜底 except 全接住。
     try:
@@ -106,10 +158,20 @@ def execute_tool(call):
         return f"错误：工具执行失败：{type(e).__name__}: {e}"
 
 
+# ---- 命令行参数（v2.1 修复"参数未生效"）----
+# 病根：v2 里没有 argparse，用户敲的 question 躺在 sys.argv 里没人读，
+# 程序永远跑写死的默认问题。nargs="?" 表示这个位置参数可填可不填：
+# 不填就用默认测试问题，填了就真正写进 user content。
+parser = argparse.ArgumentParser(description="mini agent loop：多轮工具调用问答")
+parser.add_argument("question", nargs="?",
+                    default="lessons 目录下有哪些文件？如果有名字里带 agent-loop 的课件，读一下它开头讲了什么。",
+                    help="要问的问题（不填则运行内置默认测试问题）")
+cli = parser.parse_args()
+
 messages = [
     {"role": "system", "content": "你是一个简洁的助手。"},
     {"role": "user",
-     "content": "lessons 目录下有哪些文件？如果有名字里带 agent-loop 的课件，读一下它开头讲了什么。"},
+     "content": cli.question},
 ]
 
 round_count = 0
@@ -146,7 +208,11 @@ while True:
         # v2 改造：每张工单两行——安全执行 + 回填回执。
         # 解析、查表、执行的全部风险都关在 execute_tool 里，
         # 它保证永远返回字符串，循环本体再也不会被异常炸穿。
+        # v2.1 日志：模型这张工单要干什么（参数原样打印，错误参数也看得见）
+        print(f"[第{round_count}轮] 模型调用: {call.function.name}({call.function.arguments})")
         result = execute_tool(call)
+        # v2.1 日志：回执前 80 字符——模型收到了什么（尤其错误回执）一眼可见
+        print(f"[第{round_count}轮] 回执: {result[:80]}")
         # call.id 是工单号：服务器靠它把每张回执对应回开单时的那张工单
         messages.append({"role": "tool", "tool_call_id": call.id, "content": result})
 
