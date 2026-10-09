@@ -3,10 +3,28 @@
 import json
 import os
 
+# ---------- 路径锚定（Path Anchoring，v2.4 新增） ----------
+# 概念：相对路径（如 "lessons"）必须锚定在一个固定基准上才有意义。
+# 过去工具以进程 CWD（当前工作目录）为基准——但 CWD 取决于"从哪个目录启动程序"，
+# 启动位置一变，同样的相对路径就指向完全不同的地方（语义漂移）：
+# 在 hello-harness 里启动，"lessons" 不存在；退到上一级启动，它又活了。
+# 现在把锚点显式化：优先读环境变量 MINI_HARNESS_ROOT（工作区根），
+# 没设置才退回 CWD。从此"lessons 在哪里"由工作区决定，不随启动目录漂移。
+WORKSPACE_ROOT = os.environ.get("MINI_HARNESS_ROOT", os.getcwd())
+
+
+def resolve(path):
+    """路径锚定：绝对路径原样返回，相对路径拼上工作区根。
+    三个工具内部统一先 resolve 再使用——锚定逻辑只写一处。"""
+    if os.path.isabs(path):
+        return path
+    return os.path.join(WORKSPACE_ROOT, path)
+
 
 # ---------- 工具函数（三件真家伙） ----------
 def read_file(path):
     """读取文本文件；目录路径会得到自愈提示（错误是数据，不是终点）"""
+    path = resolve(path)   # 先锚定：相对路径 → 工作区根下的绝对路径
     try:
         with open(path, "r", encoding="utf-8") as f:
             return f.read()
@@ -18,7 +36,8 @@ def read_file(path):
 
 
 def list_dir(path="."):
-    """列出目录下的文件与文件夹名"""
+    """列出目录下的文件与文件夹名（默认路径 "." 锚定后 = 工作区根）"""
+    path = resolve(path)   # 先锚定
     try:
         return "\n".join(os.listdir(path))
     except FileNotFoundError:
@@ -27,6 +46,13 @@ def list_dir(path="."):
 
 def write_file(path, content):
     """有副作用的工具：写入/覆盖文本文件。执行前必须过权限闸门（见 execute_tool）。"""
+    path = resolve(path)   # 先锚定
+    # 设计决定：写入前自动创建父目录（exist_ok=True 防重复创建报错）。
+    # 为什么可接受？① 写入意图是明确的——模型被要求"写到这个路径"，
+    #   父目录不存在属于"目录还没建"，而非"意图不明"；
+    # ② 真正的风险（覆盖已有文件、写到危险位置）已由权限闸门人工把关；
+    # ③ 不自动建目录的话，"在 lessons 创建 m2.txt"这类全新路径会无故失败。
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
         f.write(content)
     return f"已写入 {path}({len(content)} 字符)"
