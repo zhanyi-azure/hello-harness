@@ -16,6 +16,18 @@ client = OpenAI(api_key=os.environ["DEEPSEEK_API_KEY"],
 
 MAX_ROUNDS = 10   # 安全阀：最多转几轮
 
+# v2.3 上下文管理：messages（含 system）总条数上限，超过就触发历史压缩。
+# 为什么要有上限？Day 8 讲过：每轮都要把全部历史重发一遍——
+# 聊得越久，每轮的 prompt_tokens 越贵，而且总长度超过模型窗口就直接报错。
+CONTEXT_LIMIT = 8
+
+# 压缩摘要的话术模板。必须点明"保留用户硬性要求"：
+# 用户的原始要求是整个任务的【验收标准】——摘要丢了细节可以容忍，
+# 丢了约束模型就会偏离目标（比如用户说过"只读不改"，摘要里没这条，
+# 压缩后的模型可能放心大胆地写文件）。
+SUMMARY_PROMPT = ("请把以下对话历史压缩成一段『此前进展摘要』，必须保留："
+                  "用户的全部硬性要求、已完成的步骤、重要发现。摘要：")
+
 # ---------- ① 工具函数（两件真家伙） ----------
 def read_file(path):
     try:
@@ -158,6 +170,66 @@ def execute_tool(call):
         return f"错误：工具执行失败：{type(e).__name__}: {e}"
 
 
+# ---------- ③.6 上下文管理（v2.3 新增）：历史压缩 ----------
+def compress_history(messages):
+    """每轮发请求前调用。消息总数超过 CONTEXT_LIMIT 时，
+    把中间的旧消息压缩成一段摘要，只留【system + 摘要 + 最近几条】。
+    代价：多发起一次 API 调用（请模型亲自写摘要——它最懂哪些内容重要）。"""
+
+    if len(messages) <= CONTEXT_LIMIT:
+        return messages   # 没超限，原样返回（零成本）
+
+    old_count = len(messages)
+    # 为什么 system 永远保留？Day 8 的教训：API 是无状态的，剧本每轮全量重发。
+    # system 一旦被压缩掉，人设和规则就从剧本里消失了——模型立刻"人格漂移"。
+    system = messages[0]
+
+    # 为什么保留最近 4 条？它们是【正在进行的上下文】：
+    # 模型决定"下一步干什么"靠的是刚发生的事（刚读了什么、结果是什么）。
+    # 老消息的细节可以模糊（进摘要），最近的必须保真（原文保留）。
+    start = old_count - 4
+
+    # 边界修复（Day 9 的 400 教训）：如果"最近几条"的第一条是 tool 回执，
+    # 说明它配对的工单消息（assistant）落在被压缩区——回执不能没有母亲，
+    # 否则压缩完的剧本结构断裂，下次请求直接 400。往前扩到配对消息为止。
+    while start > 1 and isinstance(messages[start], dict) \
+            and messages[start].get("role") == "tool":
+        start -= 1
+
+    middle = messages[1:start]     # 被压缩区：system 之后、最近段之前的旧消息
+    recent = messages[start:]      # 保真区
+
+    if not middle:
+        return messages   # 边界修复吃掉了全部中间段——没得压，原样返回
+
+    # 把中间旧消息序列化成纯文字。注意：assistant 工单消息是 SDK 对象不是 dict，
+    # 要用 hasattr 区分（它肚子里可能有多张工单，逐张点名）
+    lines = []
+    for m in middle:
+        if hasattr(m, "tool_calls"):
+            calls = ", ".join(
+                f"{c.function.name}({c.function.arguments})" for c in (m.tool_calls or []))
+            lines.append(f"[assistant 发起工具调用] {calls}")
+        else:
+            lines.append(f"[{m.get('role', '?')}] {m.get('content', '')}")
+    history_text = "\n".join(lines)
+
+    # 额外的一次 API 调用：请模型亲自写摘要
+    summary_resp = client.chat.completions.create(
+        model="deepseek-chat",
+        messages=[
+            {"role": "system", "content": "你是一个简洁的助手。"},
+            {"role": "user", "content": SUMMARY_PROMPT + "\n" + history_text},
+        ],
+    )
+    summary = summary_resp.choices[0].message.content
+
+    new_messages = [system,
+                    {"role": "user", "content": "【此前对话摘要】" + summary}] + recent
+    print(f"【上下文压缩】旧 {old_count} 条 → 新 {len(new_messages)} 条")
+    return new_messages
+
+
 # ---- 命令行参数（v2.1 修复"参数未生效"）----
 # 病根：v2 里没有 argparse，用户敲的 question 躺在 sys.argv 里没人读，
 # 程序永远跑写死的默认问题。nargs="?" 表示这个位置参数可填可不填：
@@ -184,6 +256,9 @@ while True:
     if round_count > MAX_ROUNDS:
         print("（安全阀：轮数超限，强制收工）")
         break
+
+    # v2.3：每轮发请求前检查上下文长度——超限就先压缩历史再请求
+    messages = compress_history(messages)
 
     resp = client.chat.completions.create(
         model="deepseek-chat",
